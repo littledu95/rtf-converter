@@ -1,17 +1,31 @@
 # -*- coding: utf-8 -*-
-""" RTF 批量转换服务（纯 API 形态）
+""" RTF 批量转换服务（纯 API 形态，多进程版）
 ================================
 引擎：Microsoft Word COM，格式保真度最高
-队列：多 worker 并行消费（WORKERS 个独立 Word 实例）
+架构：Flask 主进程只管 HTTP/队列/监管；每个转换 worker 是独立子进程
+      （spawn），各自独享 COM STA + 独立 Word 实例
+并发：WORKERS 个子进程并行消费；队列有上限，超限直接 503
 进度：POST /api/convert -> GET /api/task/<id> 轮询
 下载：GET /api/task/<id>/download 打包 zip
 
-Word 生命周期（本次改造重点）：
-    - 懒加载：worker 启动不再拉起 Word，真有任务才启动
-    - 空闲释放：队列空 WORD_IDLE_TIMEOUT 秒 -> Quit()，WINWORD.EXE 退出
+为什么用子进程而不是线程：
+    - Python 无法 kill 卡死的线程；卡死的 Word 会把宿主线程永久挂起，
+      线程方案只能"放弃线程再建一个"，旧线程和 Word 实例会不断累积
+    - 子进程可以被 terminate() 强杀回收（连同它的 WINWORD.EXE），
+      HTTP 服务始终存活，多人并发互不影响
+
+Word 生命周期（每个子进程独立管理自己的实例）：
+    - 懒加载：worker 启动不拉 Word，真有任务才启动
+    - 空闲释放：队列空 WORD_IDLE_TIMEOUT 秒 -> Quit()
     - 主动回收：每 WORD_RECYCLE_FILES 个文件 / WORD_RECYCLE_SECONDS 秒换新实例
     - RPC 自愈：-2147023174(0x800706BA) 等通道断开时自动重建并重试单文件
     - 可选每任务一实例：WORD_PER_TASK=1，任务结束立刻释放，全程零常驻
+
+主进程监管（supervisor + watchdog）：
+    - 子进程通过消息队列上报：心跳 / 进度 / Word 状态 / 结果
+    - 健康、释放等 HTTP 接口只读子进程上报的普通状态，绝不跨进程碰 Word 对象
+    - 某 worker 的当前任务超过 WORD_STUCK_TIMEOUT 无心跳 -> terminate 子进程
+      + 按 PID 强杀其 WINWORD.EXE -> 只标记该任务失败 -> 自动拉起替补子进程
 
 清理策略（延迟删除）：
     - uploads_* 目录：上传完成后 UPLOAD_EXPIRE_DAYS 天过期
@@ -30,6 +44,8 @@ import shutil
 import time
 import uuid
 import ctypes
+import multiprocessing
+import subprocess
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
@@ -48,10 +64,13 @@ API_TOKEN = os.environ.get("API_TOKEN", "")
 DEFAULT_FORMATS = ["doc", "docx", "pdf"]
 FORMAT_MAP = {"doc": 0, "docx": 12, "pdf": 17}
 LARGE_RTF_BYTES = int(os.environ.get("LARGE_RTF_BYTES", str(50 * 1024 * 1024)))
-# Word COM is not a normal CPU-bound worker pool. Multiple Word instances
-# often contend over profiles, add-ins, and file locks; one stable worker is
-# the safer default. Increase explicitly only after measuring this machine.
-WORKERS = max(1, int(os.environ.get("WORKERS", "1")))
+# 每个 worker 是一个独立子进程（独立 COM STA + 独立 Word 实例）。
+# 多 worker 提升多人并发吞吐；Word 实例间会争抢配置/加载项，数值按机器实测调整。
+WORKERS = max(1, int(os.environ.get("WORKERS", "2")))
+# 任务队列上限：待处理任务超过该数量直接 503，防止并发提交打爆内存/磁盘
+QUEUE_MAX = int(os.environ.get("QUEUE_MAX", "100"))
+# 单次上传请求总大小上限（MB），超过返回 413
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "2048"))
 INSTANCE_MUTEX_NAME = "Global\\RTFConvertServer_%s" % PORT
 
 # ---- Word 实例生命周期配置 ----
@@ -88,8 +107,8 @@ WORD_RECYCLE_SECONDS = int(os.environ.get("WORD_RECYCLE_SECONDS", "3600"))
 
 # ---- 清理策略配置 ----
 UPLOAD_EXPIRE_DAYS = int(os.environ.get("UPLOAD_EXPIRE_DAYS", "3"))       # uploads 保留天数
-TMP_TASK_EXPIRE_DAYS = int(os.environ.get("TMP_TASK_EXPIRE_DAYS", "1"))   # 未下载/失败 tmp_ 保留天数
-DOWNLOAD_CLEAN_DELAY = int(os.environ.get("DOWNLOAD_CLEAN_DELAY", str(1 * 3600)))  # 下载后延迟删除（秒，默认1小时）
+TMP_TASK_EXPIRE_DAYS = int(os.environ.get("TMP_TASK_EXPIRE_DAYS", "20"))  # 未下载/失败 tmp_ 与 rtf_wps_ 保留天数
+DOWNLOAD_CLEAN_DELAY = int(os.environ.get("DOWNLOAD_CLEAN_DELAY", str(3 * 86400)))  # 下载后延迟删除（秒，默认3天）
 CLEAN_SCAN_INTERVAL = int(os.environ.get("CLEAN_SCAN_INTERVAL", "600"))   # 清理线程扫描间隔（秒，默认10分钟）
 CLEANUP_HOUR = int(os.environ.get("CLEANUP_HOUR", "2"))                    # 每天统一清理时间（本机时间）
 
@@ -104,13 +123,19 @@ logging.basicConfig(
 log = logging.getLogger("rtf-server")
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
+def _is_child_process():
+    """是否运行在 multiprocessing 拉起的转换子进程里。"""
+    return multiprocessing.current_process().name != "MainProcess"
+
+
 def _acquire_instance_mutex():
     """Allow only one app.py process to own a port on this Windows host."""
-    if os.name != "nt":
+    if os.name != "nt" or _is_child_process():
         return None
     mutex = ctypes.windll.kernel32.CreateMutexW(None, False, INSTANCE_MUTEX_NAME)
     if not mutex:
@@ -189,29 +214,61 @@ def _safe_remove(path):
     return False
 
 
-# ===================== 任务管理器 =====================
+# ===================== 任务管理器（主进程侧） =====================
+class QueueFullError(Exception):
+    """任务队列已满"""
+
+
 class TaskManager:
     _used_global = {}
     _used_global_lock = threading.Lock()
-    _wps_global_lock = threading.Lock()
-    _large_job_lock = threading.Lock()
 
     def __init__(self):
-        self._queue = queue.Queue()
         self._tasks = {}
         # 可重入锁：清理线程会在持有锁的情况下调用 is_path_active()（它也要这把锁）
         self._lock = threading.RLock()
         self._request_cache = {}
         self._request_locks = {}
         self._request_cache_ttl = 10 * 60
-        # ---- Word 生命周期相关状态 ----
-        self._busy = 0                      # 正在处理中的任务数（防止空闲误杀）
-        self._beat = time.time()            # 看门狗心跳：卡死检测用
-        self._word_state = {"app": None}    # 全局持有，供 health/release 查询
-        for _ in range(WORKERS):
-            threading.Thread(target=self._worker, daemon=True).start()
-        log.info("任务队列启动：%d 个并行 worker（Word 懒加载，空闲 %s 秒后释放）",
-                 WORKERS, WORD_IDLE_TIMEOUT or "永不")
+        # ---- 多进程 IPC（start() 里创建，只能在主进程调用）----
+        self._queue = None          # 主进程 -> 子进程：任务分发
+        self._result_queue = None   # 子进程 -> 主进程：心跳/进度/Word状态/结果
+        self._large_lock = None     # 跨进程大文件互斥
+        self._workers = {}          # wid -> {"proc","current_tid","last_beat","word_alive","word_pid","respawn_at"}
+        self._started = False
+        self._stopping = False
+
+    def start(self):
+        """在主进程里拉起 WORKERS 个转换子进程 + 监管线程。
+        子进程各自独立初始化 COM（STA）、各持一个 Word 实例；
+        卡死时整个子进程可被强杀回收，HTTP 服务不受影响。"""
+        if self._started or _is_child_process():
+            return
+        ctx = multiprocessing.get_context("spawn")
+        self._queue = ctx.Queue(maxsize=QUEUE_MAX)
+        self._result_queue = ctx.Queue()
+        self._large_lock = ctx.Lock()
+        for wid in range(WORKERS):
+            self._spawn_worker(wid)
+        threading.Thread(target=self._supervisor_loop, daemon=True,
+                         name="rtf-supervisor").start()
+        self._started = True
+        log.info("多进程架构已启动：%d 个转换子进程（各持独立 Word 实例），队列上限=%d，卡死超时=%d 秒",
+                 WORKERS, QUEUE_MAX, WORD_STUCK_TIMEOUT)
+
+    def _spawn_worker(self, wid):
+        ctx = multiprocessing.get_context("spawn")
+        p = ctx.Process(target=_worker_main,
+                        args=(wid, self._queue, self._result_queue, self._large_lock),
+                        daemon=True)
+        p.start()
+        self._workers[wid] = {
+            "proc": p, "current_tid": None,
+            "last_beat": time.time(),
+            "word_alive": False, "word_pid": None,
+            "respawn_at": 0.0,
+        }
+        log.info("[worker-%d] 转换子进程已启动 (pid=%s)", wid, p.pid)
 
     def submit(self, files, formats, out_dir, split_dirs=False):
         return self._submit([(src, base, list(formats)) for src, base in files],
@@ -232,6 +289,15 @@ class TaskManager:
         if not out_dir:
             out_dir = os.path.join(OUTPUT_DIR, "tmp_" + tid)
             is_temp = True
+        # 输出名改在主进程一次性分配（原来在 worker 线程里分配，
+        # 多进程后各进程计数独立会撞名 -> 多进程必须由主进程统一分配）
+        files4 = []
+        with TaskManager._used_global_lock:
+            d = TaskManager._used_global.setdefault(out_dir, {})
+            for src, base, fmts in files3:
+                n = d.get(base, 0)
+                d[base] = n + 1
+                files4.append((src, base, base if n == 0 else "%s_%d" % (base, n), fmts))
         with self._lock:
             self._tasks[tid] = {
                 "id": tid, "status": "pending",
@@ -243,13 +309,19 @@ class TaskManager:
                 "formats": list(formats), "out_dir": out_dir,
                 "is_temp": is_temp,
                 "split_dirs": bool(split_dirs),
-                "source_paths": [os.path.abspath(src) for src, _, _ in files3],
+                "source_paths": [os.path.abspath(src) for src, _, _, _ in files4],
                 "results": [], "log": [],
                 "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "started": None, "finished": None,
                 "clean_after": None,          # 下载后延迟删除时间戳
             }
-        self._queue.put((tid, files3, out_dir))
+        item = (tid, files4, out_dir, bool(split_dirs))
+        try:
+            self._queue.put_nowait(item)
+        except queue.Full:
+            with self._lock:
+                self._tasks.pop(tid, None)
+            raise QueueFullError("转换队列已满（上限 %d 个任务），请稍后再试" % QUEUE_MAX)
         log.info("任务 %s 入队：%d 个文件 -> %s，临时目录=%s", tid, len(files3), formats, is_temp)
         return tid
 
@@ -295,120 +367,347 @@ class TaskManager:
             return dict(t) if t else None
 
     # ------------------------------------------------------------------
-    # Word 实例生命周期：懒加载 / 空闲释放 / 主动回收 / RPC 自愈
+    # 供路由/清理线程使用的查询与控制。
+    # 只读子进程上报的普通状态，绝不在 HTTP 请求线程里访问 Word COM 对象
     # ------------------------------------------------------------------
-    @staticmethod
-    def _start_word():
-        """启动 Word COM 实例（带重试 + 握手校验）。"""
-        for attempt in range(RPC_WORD_RELAUNCH_TRIES):
-            try:
-                w = win32com.client.DispatchEx("Word.Application")
-                w.Visible = False
-                w.DisplayAlerts = 0
-                w.ScreenUpdating = False
-                try:
-                    w.FeatureInstall = 0   # msoFeatureInstallNone：避免"正在安装功能"弹窗把 Word 卡死
-                except Exception:
-                    pass
-                try:
-                    w.Options.CheckSpellingAsYouType = False
-                    w.Options.CheckGrammarAsYouType = False
-                except Exception:
-                    pass
-                try:
-                    w.AutomationSecurity = 3
-                except Exception:
-                    pass
-                w.Documents.Count          # 握手：确认 COM 通道真的通
-                log.info("Word COM 转换引擎已启动")
-                return w
-            except Exception as e:
-                log.warning("Word COM 启动失败（%d/%d）：%s",
-                            attempt + 1, RPC_WORD_RELAUNCH_TRIES, e)
-                time.sleep(1.0 * (attempt + 1))
-        log.error("Word COM 连续 %d 次启动失败", RPC_WORD_RELAUNCH_TRIES)
-        return None
+    def set_clean_after(self, tid, ts):
+        """真正把 clean_after 写到原任务上（原来 download 里改的是 get() 返回的副本）。"""
+        with self._lock:
+            t = self._tasks.get(tid)
+            if t is not None:
+                t["clean_after"] = ts
 
-    @staticmethod
-    def _word_alive(word):
-        """轻量体检：能读到 Documents.Count 说明通道还活着。"""
-        if word is None:
-            return False
-        try:
-            word.Documents.Count
-            return True
-        except Exception as e:
-            return not _is_rpc_error(e)
+    def busy_count(self):
+        with self._lock:
+            return sum(1 for w in self._workers.values() if w["current_tid"])
 
-    def word_alive(self):
-        """给 /api/health 用：当前 Word 实例是否活着。"""
-        return self._word_alive(self._word_state.get("app"))
-
-    def _kill_stale_winword(self):
-        """保险栓：干掉 Quit 后仍赖着不走的 WINWORD.EXE。
-        默认关闭（WORD_KILL_STALE=1 才启用），因为会误杀用户自己开的 Word。"""
-        try:
-            import subprocess
-            out = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq WINWORD.EXE", "/NH"],
-                capture_output=True, text=True, timeout=10,
-            )
-            if "WINWORD.EXE" not in (out.stdout or ""):
-                return 0
-            subprocess.run(["taskkill", "/F", "/IM", "WINWORD.EXE"],
-                           capture_output=True, text=True, timeout=15)
-            log.warning("[Word] 已强制结束残留 WINWORD.EXE")
-            return 1
-        except Exception as e:
-            log.warning("[Word] 清理残留 Word 进程失败：%s", e)
+    def request_release_all(self):
+        """向每个转换子进程投递释放指令，由子进程自己 Quit 自己的 Word。"""
+        notified = 0
+        if self._queue is None:
             return 0
-
-    def _relaunch_word(self, old_word, tries=None):
-        """彻底丢弃旧实例，重新拉起一个干净的 Word。"""
-        if old_word is not None:
+        for wid in self._workers:
             try:
-                old_word.Quit()
+                self._queue.put_nowait(("__release__", wid))
+                notified += 1
+            except queue.Full:
+                log.warning("[release] 队列已满，worker-%d 暂时收不到释放指令", wid)
+        return notified
+
+    def health(self):
+        with self._lock:
+            workers = []
+            word_alive = False
+            busy = 0
+            for wid, w in sorted(self._workers.items()):
+                proc_alive = bool(w["proc"] and w["proc"].is_alive())
+                if w["word_alive"]:
+                    word_alive = True
+                if w["current_tid"]:
+                    busy += 1
+                workers.append({
+                    "id": wid,
+                    "pid": w["proc"].pid if w["proc"] else None,
+                    "proc_alive": proc_alive,
+                    "busy": bool(w["current_tid"]),
+                    "task": w["current_tid"],
+                    "word_alive": w["word_alive"],
+                    "word_pid": w["word_pid"],
+                    "last_beat_age": round(time.time() - w["last_beat"], 1),
+                })
+            queued = None
+            if self._queue is not None:
+                try:
+                    queued = self._queue.qsize()
+                except Exception:
+                    queued = None
+        return {
+            "status": "ok",
+            "pid": os.getpid(),
+            "mode": "multiprocessing",
+            "workers": WORKERS,
+            "workers_detail": workers,
+            "word_alive": word_alive,
+            "word_idle_timeout": WORD_IDLE_TIMEOUT,
+            "word_per_task": WORD_PER_TASK,
+            "queue_max": QUEUE_MAX,
+            "queued": queued,
+            "busy": busy,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    # ------------------------------------------------------------------
+    # 监管线程：消费子进程消息 + 看门狗
+    # 与旧线程方案的本质区别：卡死的 worker 是子进程，可以被 terminate() 真正杀死，
+    # 只影响它自己的任务，HTTP 服务和其它子进程照常运行
+    # ------------------------------------------------------------------
+    def _supervisor_loop(self):
+        while True:
+            msg = None
+            try:
+                msg = self._result_queue.get(timeout=2)
+            except queue.Empty:
+                pass
+            except Exception as e:
+                log.warning("[监管] 读取子进程消息失败：%s", e)
+            if msg:
+                try:
+                    self._handle_msg(msg)
+                except Exception as e:
+                    log.warning("[监管] 消息处理异常：%s (%r)", e, msg)
+            try:
+                self._watchdog()
+            except Exception as e:
+                log.warning("[监管] 看门狗异常：%s", e)
+
+    def _handle_msg(self, m):
+        typ = m.get("type")
+        wid = m.get("wid")
+        tid = m.get("tid")
+        now = time.time()
+        with self._lock:
+            w = self._workers.get(wid)
+            t = self._tasks.get(tid) if tid else None
+            if t is not None:
+                t["heartbeat"] = now
+            if typ == "hello":
+                log.info("[worker-%s] 子进程就绪 (pid=%s)", wid, m.get("pid"))
+            elif typ == "word":
+                if w is not None:
+                    w["word_alive"] = bool(m.get("alive"))
+                    w["word_pid"] = m.get("pid")
+                log.info("[worker-%s] Word 状态：alive=%s pid=%s（%s）",
+                         wid, m.get("alive"), m.get("pid"), m.get("reason") or "")
+            elif typ == "claimed":
+                if w is not None:
+                    w["current_tid"] = tid
+                    w["last_beat"] = now
+                if t is not None and t["status"] == "pending":
+                    t["status"] = "running"
+                    t["started"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    t["current"] = "正在启动 Word 转换引擎"
+                    t["phase"] = "starting_engine"
+            elif typ == "beat":
+                if w is not None:
+                    w["last_beat"] = now
+            elif typ == "status":
+                if t is not None:
+                    t["current"] = m.get("current")
+                    t["phase"] = m.get("phase")
+                if w is not None:
+                    w["last_beat"] = now
+            elif typ == "file":
+                if t is not None:
+                    t["results"].append(m["entry"])
+                    t["done"] = m["done"]
+                    t["progress"] = round(m["done"] * 100.0 / max(1, m["total"]), 1)
+                    t["current"] = None
+                    t["phase"] = "file_done"
+                    t["log"].append(m["log"])
+                if w is not None:
+                    w["last_beat"] = now
+                log.info(m["log"])
+            elif typ == "log":
+                log.info("[worker-%s] %s", wid, m.get("line"))
+            elif typ == "done":
+                if w is not None:
+                    w["current_tid"] = None
+                    w["last_beat"] = now
+                if t is not None and t["status"] not in ("done", "failed"):
+                    self._finish_locked(t, m.get("status") or "done", m.get("error"))
+
+    def _finish_locked(self, t, status, error):
+        """完成任务（必须在持有 self._lock 时调用）。"""
+        t["status"] = status
+        t["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        t["phase"] = "done" if status == "done" else "failed"
+        t["heartbeat"] = time.time()
+        if status == "done":
+            t["progress"] = 100.0
+            t["current"] = None
+        if error:
+            t["error"] = error
+            t["log"].append("任务失败: " + error)
+            log.error("[%s] %s", t["id"], error)
+        else:
+            ok = sum(1 for r in t["results"] if r["ok"])
+            t["log"].append("任务完成：%d/%d 成功" % (ok, t["total"]))
+            log.info("[%s] 完成 %d/%d", t["id"], ok, t["total"])
+
+    @staticmethod
+    def _kill_worker_word(w):
+        """强杀该 worker 持有的 WINWORD.EXE（子进程被 terminate 时 Word 会变孤儿）。"""
+        pid = w.get("word_pid")
+        if not pid:
+            return
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True, text=True, timeout=10)
+            log.warning("[看门狗] 已强制结束该 worker 的 WINWORD.EXE (pid=%s)", pid)
+        except Exception as e:
+            log.warning("[看门狗] 结束 WINWORD pid=%s 失败：%s", pid, e)
+
+    def _watchdog(self):
+        now = time.time()
+        with self._lock:
+            for wid, w in list(self._workers.items()):
+                proc = w["proc"]
+                # 1) 子进程意外退出：只失败它手里的任务，再拉替补
+                if proc is not None and not proc.is_alive():
+                    tid = w["current_tid"]
+                    log.error("[worker-%d] 转换子进程退出 (exitcode=%s)", wid, proc.exitcode)
+                    if tid:
+                        t = self._tasks.get(tid)
+                        if t and t["status"] in ("pending", "running"):
+                            self._finish_locked(
+                                t, "failed",
+                                "转换子进程异常退出，该任务已标记失败（请重新提交）")
+                    w["proc"] = None
+                    w["current_tid"] = None
+                    w["word_alive"] = False
+                    w["word_pid"] = None
+                    w["respawn_at"] = now + WORD_WORKER_RESTART_DELAY
+                    continue
+                # 2) 卡死检测：该 worker 有任务且超过 WORD_STUCK_TIMEOUT 无心跳
+                #    （心跳按转换里程碑上报：领任务/每个文件开始与结束。
+                #     Word 弹模态框时 COM 调用永久挂起 -> 不再有里程碑 -> 在此被杀）
+                if proc is not None and w["current_tid"] and WORD_STUCK_TIMEOUT \
+                        and (now - w["last_beat"]) > WORD_STUCK_TIMEOUT:
+                    tid = w["current_tid"]
+                    log.error("[worker-%d] 任务 %s 超过 %d 秒无心跳，判定 Word 卡死："
+                              "终止转换子进程并回收其 Word 实例", wid, tid, WORD_STUCK_TIMEOUT)
+                    self._kill_worker_word(w)
+                    try:
+                        proc.terminate()
+                        proc.join(5)
+                    except Exception as e:
+                        log.warning("[worker-%d] 终止子进程失败：%s", wid, e)
+                    t = self._tasks.get(tid)
+                    if t and t["status"] in ("pending", "running"):
+                        self._finish_locked(
+                            t, "failed",
+                            "转换引擎无响应（Word 卡死或弹出对话框），已终止对应转换子进程")
+                    w["proc"] = None
+                    w["current_tid"] = None
+                    w["word_alive"] = False
+                    w["word_pid"] = None
+                    w["respawn_at"] = now + WORD_WORKER_RESTART_DELAY
+                    continue
+                # 3) 拉起替补子进程
+                if proc is None and not self._stopping and now >= w["respawn_at"]:
+                    self._spawn_worker(wid)
+
+# ===================== 转换子进程（worker） =====================
+# 以下函数全部运行在独立子进程里：每个子进程 CoInitialize 自己的 STA，
+# 自己启动/持有/释放 Word，与主进程通过消息队列通信
+_WPS_LOCK = threading.Lock()
+
+
+def _send_msg(result_queue, msg):
+    try:
+        result_queue.put(msg)
+    except Exception:
+        pass
+
+
+def _list_winword_pids():
+    """当前所有 WINWORD.EXE 的 PID（用于定位本子进程启动的那个 Word）。"""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq WINWORD.EXE", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return set()
+    pids = set()
+    for line in (out.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip('"') for p in line.split('","')]
+        if parts and parts[0].upper() == "WINWORD.EXE":
+            try:
+                pids.add(int(parts[1]))
+            except (IndexError, ValueError):
+                pass
+    return pids
+
+
+def _kill_stale_winword():
+    """保险栓：干掉 Quit 后仍赖着不走的 WINWORD.EXE。
+    默认关闭（WORD_KILL_STALE=1 才启用），因为会误杀用户自己开的 Word。"""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq WINWORD.EXE", "/NH"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if "WINWORD.EXE" not in (out.stdout or ""):
+            return 0
+        subprocess.run(["taskkill", "/F", "/IM", "WINWORD.EXE"],
+                       capture_output=True, text=True, timeout=15)
+        log.warning("[Word] 已强制结束残留 WINWORD.EXE")
+        return 1
+    except Exception as e:
+        log.warning("[Word] 清理残留 Word 进程失败：%s", e)
+        return 0
+
+
+def _start_word():
+    """启动一个新的 Word COM 实例（带重试 + 握手校验）。
+    用启动前后的 WINWORD 快照差集定位新实例 PID，供看门狗强杀时精确回收。"""
+    before = _list_winword_pids()
+    for attempt in range(RPC_WORD_RELAUNCH_TRIES):
+        try:
+            w = win32com.client.DispatchEx("Word.Application")
+            w.Visible = False
+            w.DisplayAlerts = 0
+            w.ScreenUpdating = False
+            try:
+                w.FeatureInstall = 0   # msoFeatureInstallNone：避免"正在安装功能"弹窗把 Word 卡死
             except Exception:
                 pass
             try:
-                del old_word
+                w.Options.CheckSpellingAsYouType = False
+                w.Options.CheckGrammarAsYouType = False
             except Exception:
                 pass
-        gc.collect()
-        for i in range(tries or RPC_WORD_RELAUNCH_TRIES):
-            time.sleep(0.5 + i)
-            w = self._start_word()
-            if w is not None and self._word_alive(w):
-                log.warning("[RPC] Word COM 实例已重建（第 %d 次尝试）", i + 1)
-                return w
-        return None
+            try:
+                w.AutomationSecurity = 3
+            except Exception:
+                pass
+            w.Documents.Count          # 握手：确认 COM 通道真的通
+            pid = None
+            new_pids = _list_winword_pids() - before
+            if new_pids:
+                pid = sorted(new_pids)[0]
+            log.info("Word COM 转换引擎已启动 (pid=%s)", pid)
+            return w, pid
+        except Exception as e:
+            log.warning("Word COM 启动失败（%d/%d）：%s",
+                        attempt + 1, RPC_WORD_RELAUNCH_TRIES, e)
+            time.sleep(1.0 * (attempt + 1))
+    log.error("Word COM 连续 %d 次启动失败", RPC_WORD_RELAUNCH_TRIES)
+    return None, None
 
-    def _relaunch_word_into(self, word_state):
-        """重建并把新实例写回 word_state，供 worker 主循环复用。"""
-        w = self._relaunch_word(word_state.get("app"))
-        if w is None:
-            return False
-        word_state["app"] = w
+
+def _word_alive(word):
+    """轻量体检：能读到 Documents.Count 说明通道还活着（只在子进程线程里调用）。"""
+    if word is None:
+        return False
+    try:
+        word.Documents.Count
         return True
+    except Exception as e:
+        return not _is_rpc_error(e)
 
-    def _ensure_word(self, word_state, reason=""):
-        """每次转换前体检，发现 RPC 断开就地重建。"""
-        if self._word_alive(word_state.get("app")):
-            return True
-        log.warning("[RPC] 检测到 Word COM 通道断开（%s），开始重建实例", reason or "健康检查")
-        new_word = self._relaunch_word(word_state.get("app"))
-        if new_word is None:
-            log.error("[RPC] Word COM 重建失败，本批后续文件将标记为失败")
-            return False
-        word_state["app"] = new_word
-        return True
 
-    def _release_word(self, word_state=None, reason=""):
-        """主动释放 Word 实例：Quit + 置空 + gc，WINWORD.EXE 随之退出。"""
-        state = word_state if word_state is not None else self._word_state
-        word = state.get("app")
-        if word is None:
-            return False
+def _release_word(word_state, wid, result_queue, reason=""):
+    """子进程主动释放自己的 Word 实例：Quit + 置空 + gc，WINWORD.EXE 随之退出。"""
+    word = word_state.get("app")
+    had_word = word is not None    # 先记下结果：del word 会解除绑定，之后不能再引用
+    word_state["app"] = None
+    word_state["pid"] = None
+    if word is not None:
         try:
             word.Quit()
         except Exception as e:
@@ -417,417 +716,373 @@ class TaskManager:
             del word
         except Exception:
             pass
-        state["app"] = None
         gc.collect()
         if WORD_KILL_STALE:
-            self._kill_stale_winword()
-        log.info("[Word] 已释放实例（%s），空闲态不再占用进程/内存", reason or "主动释放")
-        return True
+            _kill_stale_winword()
+        log.info("[Word] 已释放实例（%s）", reason or "主动释放")
+    _send_msg(result_queue, {"type": "word", "wid": wid,
+                             "alive": False, "pid": None,
+                             "reason": reason or "释放"})
+    return had_word
 
-    @staticmethod
-    def _alloc_name(out_dir, base):
-        """输出名只在这里分配一次，RPC 重试时复用同一个名字（不会退化成 xxx_1）。"""
-        with TaskManager._used_global_lock:
-            d = TaskManager._used_global.setdefault(out_dir, {})
-            n = d.get(base, 0)
-            d[base] = n + 1
-        return base if n == 0 else "%s_%d" % (base, n)
 
-    # ------------------------------------------------------------------
-    # worker 看门狗：Python 无法 kill 卡死的线程，只能"放弃 + 换一个"
-    # ------------------------------------------------------------------
-    def _fail_stuck_task(self):
-        """把卡住的任务就地判失败，别让前端永远停在 processing。"""
-        with self._lock:
-            stuck = [tid for tid, t in self._tasks.items()
-                     if t["status"] in ("pending", "running")]
-        for tid in stuck:
-            try:
-                self._finish(tid, "failed",
-                             "转换引擎无响应（Word 卡死或弹出对话框），已放弃该任务并重启转换线程")
-            except Exception as e:
-                log.warning("[看门狗] 标记卡死任务失败出错 %s: %s", tid, e)
-        return len(stuck)
-
-    def _worker(self):
-        """监管壳：内部真正干活的 _worker_loop 卡死后，拉起替补继续服务。"""
-        while True:
-            self._beat = time.time()
-            th = threading.Thread(target=self._worker_loop, daemon=True)
-            th.start()
-            while th.is_alive():
-                th.join(5)
-                if not th.is_alive():
-                    break
-                if WORD_STUCK_TIMEOUT and self._busy > 0 and \
-                        (time.time() - self._beat) > WORD_STUCK_TIMEOUT:
-                    log.error("[看门狗] 转换线程 %d 秒无心跳（busy=%d），判定 Word 卡死，"
-                              "放弃该线程并拉起替补", WORD_STUCK_TIMEOUT, self._busy)
-                    self._fail_stuck_task()
-                    self._busy = 0
-                    if WORD_KILL_STALE:
-                        self._kill_stale_winword()
-                    # 旧线程的 app 引用已是僵尸（连 Quit 都会挂起），弃用旧槽位
-                    self._word_state = {"app": None}
-                    break
-            log.warning("[看门狗] 转换线程已退出，%d 秒后拉起替补", WORD_WORKER_RESTART_DELAY)
-            time.sleep(WORD_WORKER_RESTART_DELAY)
-
-    # ------------------------------------------------------------------
-    # worker：懒加载 + 空闲释放
-    # ------------------------------------------------------------------
-    def _worker_loop(self):
-        pythoncom.CoInitialize()
-        word_state = {"app": None}
-        # WORKERS=1 时本线程即唯一转换线程，用 self._word_state 暴露给外部接口
-        if self._word_state.get("app") is None:
-            self._word_state = word_state
-        idle_since = None
+def _relaunch_word_into(word_state, wid, result_queue, reason=""):
+    """彻底丢弃旧实例，重新拉起一个干净的 Word 并写回 word_state。"""
+    old = word_state.get("app")
+    if old is not None:
         try:
-            while True:
-                self._beat = time.time()
-                # ---- 取任务：带超时，超时即判定为空闲 ----
-                try:
-                    tid, files3, out_dir = self._queue.get(timeout=WORD_POLL_INTERVAL)
-                except queue.Empty:
-                    if word_state["app"] is None:
-                        idle_since = None
+            old.Quit()
+        except Exception:
+            pass
+        try:
+            del old
+        except Exception:
+            pass
+    word_state["app"] = None
+    word_state["pid"] = None
+    gc.collect()
+    for i in range(RPC_WORD_RELAUNCH_TRIES):
+        time.sleep(0.5 + i)
+        w, pid = _start_word()
+        if w is not None and _word_alive(w):
+            word_state["app"] = w
+            word_state["pid"] = pid
+            _send_msg(result_queue, {"type": "word", "wid": wid,
+                                     "alive": True, "pid": pid,
+                                     "reason": reason or "重建"})
+            log.warning("[RPC] Word COM 实例已重建（第 %d 次尝试）", i + 1)
+            return True
+    _send_msg(result_queue, {"type": "word", "wid": wid,
+                             "alive": False, "pid": None, "reason": "重建失败"})
+    log.error("[RPC] Word COM 重建失败，本批后续文件将标记为失败")
+    return False
+
+
+def _ensure_word(word_state, wid, result_queue, reason=""):
+    """每次转换前体检，发现 RPC 断开就地重建。"""
+    if _word_alive(word_state.get("app")):
+        return True
+    log.warning("[RPC] 检测到 Word COM 通道断开（%s），开始重建实例", reason or "健康检查")
+    return _relaunch_word_into(word_state, wid, result_queue, reason)
+
+
+def _process_task(tid, files4, out_dir, split_dirs, word_state, wid, result_queue):
+    """转换一个任务的全部文件。返回 (large_seen, error)。
+    进度/心跳/结果通过消息发回主进程（子进程不直接改主进程内存里的任务表）。"""
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception as e:
+        return False, "output directory error: %s" % e
+
+    wps_state = {"app": None}
+    large_seen = False
+    files_since_recycle = 0
+    recycle_at = time.time() + WORD_RECYCLE_SECONDS if WORD_RECYCLE_SECONDS else 0
+
+    try:
+        for i, (src, base, name, fmts) in enumerate(files4, 1):
+            _send_msg(result_queue, {"type": "beat", "wid": wid, "tid": tid})
+            entry = {"src": os.path.basename(src), "ok": False,
+                     "outputs": [], "formats": {}, "error": None}
+            try:
+                # ---- 0) 主动回收 Word：句柄/内存累积是崩溃的头号诱因 ----
+                need_recycle = (
+                    (WORD_RECYCLE_FILES and files_since_recycle >= WORD_RECYCLE_FILES)
+                    or (WORD_RECYCLE_SECONDS and time.time() > recycle_at)
+                )
+                if need_recycle:
+                    if _relaunch_word_into(word_state, wid, result_queue, "主动回收"):
+                        log.info("[%s] 主动回收 Word 实例（已连续转换 %d 个文件）",
+                                 tid, files_since_recycle)
+                    files_since_recycle = 0
+                    recycle_at = time.time() + WORD_RECYCLE_SECONDS
+
+                # ---- 1) 源文件体检：别拿空文件/不存在的文件去喂崩 Word ----
+                if not os.path.isfile(src):
+                    raise RuntimeError("源文件不存在，跳过")
+                if os.path.getsize(src) == 0:
+                    raise RuntimeError("源文件为空（0 字节），跳过")
+                size_mb = os.path.getsize(src) / (1024.0 * 1024.0)
+                is_large = os.path.getsize(src) >= LARGE_RTF_BYTES
+                large_seen = large_seen or is_large
+
+                _send_msg(result_queue, {
+                    "type": "status", "wid": wid, "tid": tid,
+                    "current": ("正在打开 %s（%.1f MB）" % (os.path.basename(src), size_mb)
+                                if is_large else "正在打开 " + os.path.basename(src)),
+                    "phase": "opening",
+                })
+
+                # ---- 2) 单次转换 + RPC 自愈重试（输出名已在主进程分配好）----
+                results = None
+                last_err = None
+                for attempt in range(RPC_RETRY + 1):
+                    if not _ensure_word(word_state, wid, result_queue,
+                                        "转换 %s 前" % os.path.basename(src)):
+                        raise RuntimeError("Word COM 不可用且无法重建")
+                    try:
+                        results = _convert_one(
+                            word_state["app"], wps_state, src, fmts,
+                            out_dir, name, bool(split_dirs))
+                    except Exception as e:
+                        last_err = e
+                        results = None
+                        if _is_rpc_error(e) and attempt < RPC_RETRY:
+                            log.warning("[%s] %s 打开/保存时 RPC 断开（第 %d 次），重建 Word 后重试：%s",
+                                        tid, os.path.basename(src), attempt + 1, e)
+                            _relaunch_word_into(word_state, wid, result_queue, "RPC 重试")
+                            time.sleep(RPC_RETRY_SLEEP)
+                            continue
+                        raise
+                    # _save_document 会把异常吞进 results，补一次检查
+                    if _results_have_rpc(results) and attempt < RPC_RETRY:
+                        log.warning("[%s] %s 保存时 RPC 断开（第 %d 次），重建 Word 后重试",
+                                    tid, os.path.basename(src), attempt + 1)
+                        _relaunch_word_into(word_state, wid, result_queue, "RPC 重试")
+                        time.sleep(RPC_RETRY_SLEEP)
                         continue
-                    if self._busy > 0:
-                        idle_since = None
-                        continue
-                    if not WORD_IDLE_TIMEOUT:
-                        continue
+                    break
+
+                if results is None:
+                    raise last_err or RuntimeError("转换未返回结果")
+
+                # ---- 3) 结果汇总 ----
+                entry["ok"] = any(r["ok"] for r in results.values())
+                entry["outputs"] = [r["path"] for r in results.values() if r["ok"]]
+                entry["formats"] = {
+                    k: ("OK" if v["ok"] else ("FAIL: " + (v["error"] or "")))
+                    for k, v in results.items()}
+                detail = " ".join(
+                    "%s:%s" % (k, ("WPS" if v.get("via_wps") else "OK")
+                               if v["ok"] else ("FAIL:" + (v["error"] or "")))
+                    for k, v in results.items())
+            except Exception as e:
+                entry["error"] = str(e)[:300]
+                detail = "FAIL: " + entry["error"]
+                log.warning("[%s] %s 转换失败：%s", tid, os.path.basename(src), e)
+
+            files_since_recycle += 1
+            _send_msg(result_queue, {
+                "type": "file", "wid": wid, "tid": tid,
+                "entry": entry, "done": i, "total": len(files4),
+                "log": "[%d/%d] %s -> %s" % (i, len(files4), entry["src"], detail),
+            })
+    finally:
+        _close_app(wps_state.get("app"))
+        wps_state["app"] = None
+
+    return large_seen, None
+
+
+def _worker_main(wid, task_queue, result_queue, large_lock):
+    """转换子进程入口：独享 COM STA 与 Word 实例，可被主进程整体回收。"""
+    pythoncom.CoInitialize()
+    _send_msg(result_queue, {"type": "hello", "wid": wid, "pid": os.getpid()})
+    word_state = {"app": None, "pid": None}
+    idle_since = None
+    try:
+        while True:
+            # 主服务已死 -> 自行退出，避免留下孤儿子进程
+            parent = multiprocessing.parent_process()
+            if parent is not None and not parent.is_alive():
+                log.info("[worker-%d] 主服务已退出，转换子进程自行结束", wid)
+                return
+            # ---- 取任务：带超时，超时即判定为空闲 ----
+            try:
+                item = task_queue.get(timeout=WORD_POLL_INTERVAL)
+            except queue.Empty:
+                if word_state["app"] is not None and WORD_IDLE_TIMEOUT:
                     now = time.time()
                     if idle_since is None:
                         idle_since = now
                     elif now - idle_since >= WORD_IDLE_TIMEOUT:
-                        self._release_word(word_state, reason="空闲 %d 秒" % WORD_IDLE_TIMEOUT)
+                        _release_word(word_state, wid, result_queue,
+                                      "空闲 %d 秒" % WORD_IDLE_TIMEOUT)
                         idle_since = None
-                    continue
+                continue
 
-                idle_since = None
-                self._busy += 1
-                try:
-                    with self._lock:
-                        task = self._tasks.get(tid)
-                        if task and task["status"] == "pending":
-                            task["status"] = "running"
-                            task["started"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            task["current"] = "正在启动 Word 转换引擎"
-                            task["phase"] = "starting_engine"
-                            task["heartbeat"] = time.time()
+            idle_since = None
 
-                    # ---- 懒加载：只有真要转了才启动 Word ----
-                    if word_state["app"] is None:
-                        word_state["app"] = self._start_word()
-                        if word_state["app"] is None:
-                            self._finish(tid, "failed", "Word COM 初始化失败")
-                            continue
+            # ---- 控制指令：手动释放 Word ----
+            if item[0] == "__release__":
+                _release_word(word_state, wid, result_queue, "手动调用 /api/word/release")
+                continue
+
+            tid, files4, out_dir, split_dirs = item
+            _send_msg(result_queue, {"type": "claimed", "wid": wid, "tid": tid})
+            status = "done"
+            error = None
+            try:
+                large_job = any(os.path.getsize(src) >= LARGE_RTF_BYTES
+                                for src, _, _, _ in files4)
+                if large_job:
+                    # 大文件任务跨进程互斥：避免多个 Word 同时装载超大文档。
+                    # 用带超时的循环拿锁，等待期间照常上报心跳，防止看门狗误杀
+                    acquired = False
+                    while not acquired:
+                        _send_msg(result_queue, {"type": "beat", "wid": wid, "tid": tid})
+                        acquired = large_lock.acquire(timeout=10)
                     try:
-                        is_large_job = any(
-                            os.path.getsize(src) >= LARGE_RTF_BYTES
-                            for src, _, _ in files3
-                        )
-                        if is_large_job:
-                            with TaskManager._large_job_lock:
-                                restart_word = self._process_optimized(
-                                    tid, files3, out_dir, word_state)
-                        else:
-                            restart_word = self._process_optimized(
-                                tid, files3, out_dir, word_state)
-
-                        # ---- 每任务一实例：任务收尾立刻释放 ----
-                        if WORD_PER_TASK and not restart_word:
-                            self._release_word(word_state, reason="任务 %s 结束（每任务一实例）" % tid)
-
-                        if restart_word:
-                            self._release_word(word_state, reason="大文件任务结束")
-                    except Exception as e:
-                        log.error("[%s] 任务处理异常，重建 Word 实例: %s", tid, e)
-                        with self._lock:
-                            task = self._tasks.get(tid)
-                            unfinished = task and task["status"] not in ("done", "failed")
-                        if unfinished:
-                            self._finish(tid, "failed", "任务处理异常：%s" % str(e)[:300])
-                        self._release_word(word_state, reason="任务异常，回收后下次重建")
-                finally:
-                    self._busy = max(0, self._busy - 1)
-        finally:
-            self._release_word(word_state, reason="worker 退出")
-            pythoncom.CoUninitialize()
-
-    # ------------------------------------------------------------------
-    # 批量转换主流程：体检 + RPC 重试 + 主动回收
-    # ------------------------------------------------------------------
-    def _process_optimized(self, tid, files3, out_dir, word_state):
-        """word_state: {"app": word} —— 字典传递，重建后能回传 worker。"""
-        t = self._tasks[tid]
-        with self._lock:
-            t["status"] = "running"
-            t["started"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-        except Exception as e:
-            self._finish(tid, "failed", "output directory error: %s" % e)
-            return False
-
-        wps_state = {"app": None}
-        large_seen = False
-        files_since_recycle = 0
-        recycle_at = time.time() + WORD_RECYCLE_SECONDS if WORD_RECYCLE_SECONDS else 0
-
-        try:
-            with self._lock:
-                t["total"] = len(files3)
-
-            for i, (src, base, fmts) in enumerate(files3, 1):
-                self._beat = time.time()   # 看门狗心跳：单文件卡死也能被检测到
-                entry = {"src": os.path.basename(src), "ok": False,
-                         "outputs": [], "formats": {}, "error": None}
-                try:
-                    # ---- 0) 主动回收 Word：句柄/内存累积是崩溃的头号诱因 ----
-                    need_recycle = (
-                        (WORD_RECYCLE_FILES and files_since_recycle >= WORD_RECYCLE_FILES)
-                        or (WORD_RECYCLE_SECONDS and time.time() > recycle_at)
-                    )
-                    if need_recycle:
-                        if self._relaunch_word_into(word_state):
-                            log.info("[%s] 主动回收 Word 实例（已连续转换 %d 个文件）",
-                                     tid, files_since_recycle)
-                        files_since_recycle = 0
-                        recycle_at = time.time() + WORD_RECYCLE_SECONDS
-
-                    # ---- 1) 源文件体检：别拿空文件/不存在的文件去喂崩 Word ----
-                    if not os.path.isfile(src):
-                        raise RuntimeError("源文件不存在，跳过")
-                    if os.path.getsize(src) == 0:
-                        raise RuntimeError("源文件为空（0 字节），跳过")
-                    size_mb = os.path.getsize(src) / (1024.0 * 1024.0)
-                    is_large = os.path.getsize(src) >= LARGE_RTF_BYTES
-                    large_seen = large_seen or is_large
-
-                    with self._lock:
-                        t["current"] = ("正在打开 %s（%.1f MB）" % (os.path.basename(src), size_mb)
-                                        if is_large else "正在打开 " + os.path.basename(src))
-                        t["phase"] = "opening"
-                        t["heartbeat"] = time.time()
-
-                    # ---- 2) 输出名只分配一次 ----
-                    name = self._alloc_name(out_dir, base)
-
-                    # ---- 3) 单次转换 + RPC 自愈重试 ----
-                    results = None
-                    last_err = None
-                    for attempt in range(RPC_RETRY + 1):
-                        if not self._ensure_word(word_state, "转换 %s 前" % os.path.basename(src)):
-                            raise RuntimeError("Word COM 不可用且无法重建")
-                        try:
-                            results = self._convert_one(
-                                word_state["app"], wps_state, src, fmts,
-                                out_dir, name, bool(t.get("split_dirs")))
-                        except Exception as e:
-                            last_err = e
-                            results = None
-                            if _is_rpc_error(e) and attempt < RPC_RETRY:
-                                log.warning("[%s] %s 打开/保存时 RPC 断开（第 %d 次），重建 Word 后重试：%s",
-                                            tid, os.path.basename(src), attempt + 1, e)
-                                self._relaunch_word_into(word_state)
-                                time.sleep(RPC_RETRY_SLEEP)
-                                continue
-                            raise
-                        # _save_document 会把异常吞进 results，补一次检查
-                        if _results_have_rpc(results) and attempt < RPC_RETRY:
-                            log.warning("[%s] %s 保存时 RPC 断开（第 %d 次），重建 Word 后重试",
-                                        tid, os.path.basename(src), attempt + 1)
-                            self._relaunch_word_into(word_state)
-                            time.sleep(RPC_RETRY_SLEEP)
-                            continue
-                        break
-
-                    if results is None:
-                        raise last_err or RuntimeError("转换未返回结果")
-
-                    # ---- 4) 结果汇总 ----
-                    entry["ok"] = any(r["ok"] for r in results.values())
-                    entry["outputs"] = [r["path"] for r in results.values() if r["ok"]]
-                    entry["formats"] = {
-                        k: ("OK" if v["ok"] else ("FAIL: " + (v["error"] or "")))
-                        for k, v in results.items()}
-                    detail = " ".join(
-                        "%s:%s" % (k, ("WPS" if v.get("via_wps") else "OK")
-                                   if v["ok"] else ("FAIL:" + (v["error"] or "")))
-                        for k, v in results.items())
-                except Exception as e:
-                    entry["error"] = str(e)[:300]
-                    detail = "FAIL: " + entry["error"]
-                    log.warning("[%s] %s 转换失败：%s", tid, os.path.basename(src), e)
-
-                files_since_recycle += 1
-                with self._lock:
-                    t["results"].append(entry)
-                    t["done"] = i
-                    t["progress"] = round(i * 100.0 / len(files3), 1)
-                    t["current"] = None
-                    t["phase"] = "file_done"
-                    t["heartbeat"] = time.time()
-                    t["log"].append("[%d/%d] %s -> %s" % (i, len(files3), entry["src"], detail))
-                log.info("[%s] %d/%d %s -> %s", tid, i, len(files3), entry["src"], detail)
-        finally:
-            self._close_app(wps_state.get("app"))
-            wps_state["app"] = None
-
-        self._finish(tid, "done", None)
-        return large_seen
-
-    @staticmethod
-    def _close_app(app):
-        if app is not None:
-            try:
-                app.Quit()
-            except Exception:
-                pass
-            try:
-                del app
-            except Exception:
-                pass
-        gc.collect()
-
-    @staticmethod
-    def _convert_one(word, wps_state, src, formats, out_dir, name, split_dirs=False):
-        """name 由调用方预先分配（重试时复用），不再在这里自增。"""
-        doc = None
-        try:
-            open_args = {
-                "FileName": os.path.abspath(src),
-                "ConfirmConversions": False,
-                "ReadOnly": True,
-                "AddToRecentFiles": False,
-                "Visible": False,
-                "OpenAndRepair": False,
-            }
-            try:
-                doc = word.Documents.Open(**open_args)
-            except Exception as e_first:
-                if _is_rpc_error(e_first):
-                    raise                      # RPC 断开：不要硬撑，交给上层重建 Word
-                open_args["OpenAndRepair"] = True
-                doc = word.Documents.Open(**open_args)
-            return TaskManager._save_document(
-                doc, wps_state, src, formats, out_dir, name, split_dirs)
-        finally:
-            if doc is not None:
-                try:
-                    doc.Close(False)
-                except Exception as e:
-                    if _is_rpc_error(e):
-                        log.warning("关闭文档时 RPC 已断开（实例需重建）：%s", src)
-                    else:
-                        log.warning("关闭 Word 文档失败：%s: %s", src, e)
-                doc = None
-                gc.collect()
-
-    @staticmethod
-    def _save_document(doc, wps_state, src, formats, out_dir, name, split_dirs=False):
-        results = {}
-        for fmt in formats:
-            if split_dirs:
-                fmt_dir = os.path.join(out_dir, fmt)
-                os.makedirs(fmt_dir, exist_ok=True)
-                out_path = os.path.join(fmt_dir, "%s.%s" % (name, fmt))
-            else:
-                out_path = os.path.join(out_dir, "%s.%s" % (name, fmt))
-            results[fmt] = {"ok": False, "path": out_path, "error": None, "via_wps": False}
-            try:
-                if fmt == "pdf":
-                    # 明确指定书签来源。Word 默认值并不稳定，且 RTF 的显式
-                    # 书签不会自动写入 PDF；CreateBookmarks=2 保留原文书签。
-                    doc.ExportAsFixedFormat(
-                        out_path,
-                        ExportFormat=17,
-                        CreateBookmarks=PDF_CREATE_BOOKMARKS,
-                    )
-                elif fmt == "docx":
-                    try:
-                        doc.SaveAs2(out_path, FileFormat=12)
-                    except Exception as e1:
-                        results[fmt]["error"] = str(e1)[:200]
-                        wps = TaskManager._get_wps(wps_state)
-                        if wps is None:
-                            raise
-                        fallback_src = src
-                        fallback_rtf = None
-                        try:
-                            fd, fallback_rtf = tempfile.mkstemp(
-                                prefix="rtf_wps_", suffix=".rtf", dir=OUTPUT_DIR)
-                            os.close(fd)
-                            doc.SaveAs2(fallback_rtf, FileFormat=6)
-                            fallback_src = fallback_rtf
-                        except Exception:
-                            fallback_src = src
-                        try:
-                            with TaskManager._wps_global_lock:
-                                TaskManager._wps_save_docx(wps, fallback_src, out_path)
-                        finally:
-                            if fallback_rtf:
-                                _safe_remove(fallback_rtf)
-                        results[fmt]["via_wps"] = True
-                        results[fmt]["error"] = None
+                        large_seen, err = _process_task(
+                            tid, files4, out_dir, split_dirs, word_state, wid, result_queue)
+                    finally:
+                        large_lock.release()
                 else:
-                    doc.SaveAs2(out_path, FileFormat=FORMAT_MAP[fmt])
-                results[fmt]["ok"] = True
+                    large_seen, err = _process_task(
+                        tid, files4, out_dir, split_dirs, word_state, wid, result_queue)
+
+                if err:
+                    status = "failed"
+                    error = err
+                    _release_word(word_state, wid, result_queue, "任务出错，回收后重建")
+                elif large_seen:
+                    _release_word(word_state, wid, result_queue, "大文件任务结束")
+                elif WORD_PER_TASK:
+                    _release_word(word_state, wid, result_queue,
+                                  "任务 %s 结束（每任务一实例）" % tid)
             except Exception as e:
-                results[fmt]["error"] = str(e)[:300]
-        return results
-
-    @staticmethod
-    def _get_wps(wps_state):
-        if wps_state["app"] is None:
-            try:
-                wps = win32com.client.DispatchEx("Kwps.Application")
-                wps.Visible = False
-                try:
-                    wps.DisplayAlerts = 0
-                except Exception:
-                    pass
-                wps_state["app"] = wps
-            except Exception:
-                return None
-        return wps_state["app"]
-
-    @staticmethod
-    def _wps_save_docx(wps, src, out_path):
-        wdoc = None
+                log.error("[%s] 任务处理异常，回收 Word 实例：%s", tid, e)
+                status = "failed"
+                error = "任务处理异常：%s" % str(e)[:300]
+                _release_word(word_state, wid, result_queue, "任务异常，回收后下次重建")
+            _send_msg(result_queue, {"type": "done", "wid": wid, "tid": tid,
+                                     "status": status, "error": error})
+    finally:
+        _release_word(word_state, wid, result_queue, "worker 退出")
         try:
-            wdoc = wps.Documents.Open(os.path.abspath(src), ReadOnly=True)
-            wdoc.SaveAs2(out_path, FileFormat=12)
-        finally:
-            if wdoc is not None:
-                try:
-                    wdoc.Close(False)
-                except Exception as e:
-                    log.warning("关闭 WPS 文档失败：%s: %s", src, e)
-                wdoc = None
-                gc.collect()
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
 
-    def _finish(self, tid, status, error):
-        with self._lock:
-            t = self._tasks[tid]
-            t["status"] = status
-            t["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            t["phase"] = "done" if status == "done" else "failed"
-            t["heartbeat"] = time.time()
-            if status == "done":
-                t["progress"] = 100.0
-                t["current"] = None
-            if error:
-                t["error"] = error
-                t["log"].append("任务失败: " + error)
-                log.error("[%s] %s", tid, error)
+def _close_app(app):
+    if app is not None:
+        try:
+            app.Quit()
+        except Exception:
+            pass
+        try:
+            del app
+        except Exception:
+            pass
+    gc.collect()
+
+
+def _convert_one(word, wps_state, src, formats, out_dir, name, split_dirs=False):
+    """name 由主进程预先分配（RPC 重试时复用），不再在这里自增。"""
+    doc = None
+    try:
+        open_args = {
+            "FileName": os.path.abspath(src),
+            "ConfirmConversions": False,
+            "ReadOnly": True,
+            "AddToRecentFiles": False,
+            "Visible": False,
+            "OpenAndRepair": False,
+        }
+        try:
+            doc = word.Documents.Open(**open_args)
+        except Exception as e_first:
+            if _is_rpc_error(e_first):
+                raise                      # RPC 断开：不要硬撑，交给上层重建 Word
+            open_args["OpenAndRepair"] = True
+            doc = word.Documents.Open(**open_args)
+        return _save_document(
+            doc, wps_state, src, formats, out_dir, name, split_dirs)
+    finally:
+        if doc is not None:
+            try:
+                doc.Close(False)
+            except Exception as e:
+                if _is_rpc_error(e):
+                    log.warning("关闭文档时 RPC 已断开（实例需重建）：%s", src)
+                else:
+                    log.warning("关闭 Word 文档失败：%s: %s", src, e)
+            doc = None
+            gc.collect()
+
+
+def _save_document(doc, wps_state, src, formats, out_dir, name, split_dirs=False):
+    results = {}
+    for fmt in formats:
+        if split_dirs:
+            fmt_dir = os.path.join(out_dir, fmt)
+            os.makedirs(fmt_dir, exist_ok=True)
+            out_path = os.path.join(fmt_dir, "%s.%s" % (name, fmt))
+        else:
+            out_path = os.path.join(out_dir, "%s.%s" % (name, fmt))
+        results[fmt] = {"ok": False, "path": out_path, "error": None, "via_wps": False}
+        try:
+            if fmt == "pdf":
+                # 明确指定书签来源。Word 默认值并不稳定，且 RTF 的显式
+                # 书签不会自动写入 PDF；CreateBookmarks=2 保留原文书签。
+                doc.ExportAsFixedFormat(
+                    out_path,
+                    ExportFormat=17,
+                    CreateBookmarks=PDF_CREATE_BOOKMARKS,
+                )
+            elif fmt == "docx":
+                try:
+                    doc.SaveAs2(out_path, FileFormat=12)
+                except Exception as e1:
+                    results[fmt]["error"] = str(e1)[:200]
+                    wps = _get_wps(wps_state)
+                    if wps is None:
+                        raise
+                    fallback_src = src
+                    fallback_rtf = None
+                    try:
+                        fd, fallback_rtf = tempfile.mkstemp(
+                            prefix="rtf_wps_", suffix=".rtf", dir=OUTPUT_DIR)
+                        os.close(fd)
+                        doc.SaveAs2(fallback_rtf, FileFormat=6)
+                        fallback_src = fallback_rtf
+                    except Exception:
+                        fallback_src = src
+                    try:
+                        with _WPS_LOCK:
+                            _wps_save_docx(wps, fallback_src, out_path)
+                    finally:
+                        # 不做立即删除：WPS/Word 可能仍持有句柄，马上删必报
+                        # WinError 32。留在原地交给 _auto_clean_all 定时清理
+                        pass
+                    results[fmt]["via_wps"] = True
+                    results[fmt]["error"] = None
             else:
-                ok = sum(1 for r in t["results"] if r["ok"])
-                t["log"].append("任务完成：%d/%d 成功" % (ok, t["total"]))
-                log.info("[%s] 完成 %d/%d", tid, ok, t["total"])
+                doc.SaveAs2(out_path, FileFormat=FORMAT_MAP[fmt])
+            results[fmt]["ok"] = True
+        except Exception as e:
+            results[fmt]["error"] = str(e)[:300]
+    return results
+
+
+def _get_wps(wps_state):
+    if wps_state["app"] is None:
+        try:
+            wps = win32com.client.DispatchEx("Kwps.Application")
+            wps.Visible = False
+            try:
+                wps.DisplayAlerts = 0
+            except Exception:
+                pass
+            wps_state["app"] = wps
+        except Exception:
+            return None
+    return wps_state["app"]
+
+
+def _wps_save_docx(wps, src, out_path):
+    wdoc = None
+    try:
+        wdoc = wps.Documents.Open(os.path.abspath(src), ReadOnly=True)
+        wdoc.SaveAs2(out_path, FileFormat=12)
+    finally:
+        if wdoc is not None:
+            try:
+                wdoc.Close(False)
+            except Exception as e:
+                log.warning("关闭 WPS 文档失败：%s: %s", src, e)
+            wdoc = None
+            gc.collect()
 
 
 # ===================== 统一自动清理（延迟删除） =====================
@@ -922,6 +1177,8 @@ def _auto_clean_all():
             _clean_by_prefix(UPLOAD_DIR, "uploads_", upload_cutoff, "uploads")
             _clean_by_prefix(OUTPUT_DIR, "tmp_", tmp_task_cutoff, "tmp任务")
             _clean_old_files("rtf_download_", tmp_task_cutoff)
+            # WPS 兜底转换的中间 rtf_wps_*.rtf（docx 失败时生成），异常中断会泄漏
+            _clean_old_files("rtf_wps_", tmp_task_cutoff)
 
             # 已下载 tmp_* 按 clean_after 延迟删除
             with manager._lock:
@@ -979,14 +1236,13 @@ th{background:#fafafa;font-weight:600}
 .progress-track{height:12px;background:#e9edf3;border-radius:999px;overflow:hidden;margin-top:8px}
 .progress-fill{height:100%;width:0;background:#2563eb;border-radius:inherit;transition:width .35s ease}
 .log-label{margin-top:16px;color:#6b7280;font-size:12px;font-weight:600}
-.log{font-size:12px;color:#4b5563;background:#f8fafc;border:1px solid #edf0f4;border-radius:8px;padding:10px;margin-top:6px;max-height:180px;overflow:auto;white-space:pre-wrap;font-family:Consolas,monospace}
+.log{font-size:12px;color:#4b5563;background:#f8fafc;border:1px solid #edf0f4;border-radius:8px;padding:10px;margin-top:6px;max-height:220px;overflow:auto;white-space:pre-wrap;font-family:Consolas,monospace}
 .hide{display:none}
-#dlBtn[href="#"]{visibility:hidden;pointer-events:none}
 </style>
 </head>
 <body>
 <h1>RTF 批量转换</h1>
-<div class="sub">转换引擎：Word · 支持 doc / docx / pdf · 空闲自动释放 · RPC 断开自动重建重试</div>
+<div class="sub">转换引擎：Word · 多进程 worker 并发 · 支持 doc / docx / pdf · 空闲自动释放 · RPC 断开自动重建重试</div>
 
 <div class="card">
     <div style="font-size:14px;font-weight:600;margin-bottom:8px">输入（二选一：拖拽上传 或 输入服务端文件夹路径）</div>
@@ -1024,7 +1280,14 @@ th{background:#fafafa;font-weight:600}
 </div>
 
 <div class="card">
-    <h3 style="margin:0 0 8px">任务列表</h3>
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px">
+        <h3 style="margin:0">任务列表</h3>
+        <div style="display:flex;align-items:center;gap:10px">
+            <span id="svcStatus" style="font-size:12px;color:#6b7280">服务状态加载中…</span>
+            <button class="btn2" id="dlAllBtn" style="padding:4px 10px;font-size:12px" onclick="downloadAll()" disabled>下载全部</button>
+            <button class="btn2" style="padding:4px 10px;font-size:12px" onclick="releaseWord()">释放 Word</button>
+        </div>
+    </div>
     <table>
         <thead>
             <tr>
@@ -1038,25 +1301,19 @@ th{background:#fafafa;font-weight:600}
         </thead>
         <tbody id="taskList"></tbody>
     </table>
-    <div class="log-label">全局处理记录</div>
+    <div class="log-label">全局处理记录（多任务并行时按任务号区分）</div>
     <div class="log" id="log"></div>
-    <div style="margin-top:12px">
-        <a class="btn" id="dlBtn" style="text-decoration:none;display:inline-block" href="#">下载结果 zip</a>
-        <button class="btn2" style="margin-left:8px" onclick="releaseWord()">释放 Word 实例</button>
-    </div>
 </div>
 
 <script>
 var files = [];
-var taskId = null;
+var tasks = new Map();          // tid -> {name, finished, lastLog}，支持多任务并行跟踪
 var submitInFlight = false;
 var submissionRequestId = null;
-var pollDelay = 1200;
 var pollTimer = null;
 const uploadBox = document.getElementById("uploadBox");
 const fileInput = document.getElementById("file-input");
 const taskListEl = document.getElementById("taskList");
-const taskMap = new Map();
 
 function pickDir(btn) {
   var old = btn.textContent;
@@ -1078,12 +1335,15 @@ function pickDir(btn) {
 }
 
 function releaseWord() {
+  if (!confirm('通知所有转换 worker 立即退出 Word 实例？\\n（空闲超过 5 分钟本来会自动释放，一般不需要手动点）')) return;
   fetch('/api/word/release', { method: 'POST' })
     .then(function(r){ return r.json(); })
     .then(function(j){
-      alert(j.error ? ('释放失败：' + j.error) : ('已释放，Word 当前存活=' + j.word_alive));
+      setLog(j.error ? '释放 Word 失败：' + j.error
+                     : '已通知 ' + (j.notified || 0) + ' 个转换 worker 释放 Word 实例');
+      refreshSvc();
     })
-    .catch(function(e){ alert('请求失败：' + e); });
+    .catch(function(e){ setLog('释放请求失败：' + e); });
 }
 
 uploadBox.onclick = () => fileInput.click();
@@ -1220,9 +1480,16 @@ function submit() {
         document.getElementById('goBtn').disabled = false;
         return;
       }
-      taskId = j.task_id;
-      addRow(taskId, "批量任务", "-");
-      poll();
+      var tid = j.task_id;
+      var nFiles = files.length;
+      tasks.set(tid, { name: '批量任务（' + nFiles + ' 个文件）', finished: false, lastLog: [] });
+      addRow(tid, '批量任务（' + nFiles + ' 个文件）', '-');
+      files = [];
+      renderFiles();
+      document.getElementById('pathInput').value = '';
+      document.getElementById('goBtn').disabled = false;
+      startPolling();
+      setLog('任务已提交：' + tid.slice(0,8) + '（可继续提交下一批，无需等待）');
     })
     .catch(function(e){
       submitInFlight = false;
@@ -1244,64 +1511,147 @@ function addRow(tid, name, size) {
     <td>排队中…</td>
     <td></td>`;
   taskListEl.appendChild(tr);
-  taskMap.set(tid, tr);
 }
 
-function poll() {
-  fetch('/api/task/' + taskId)
-    .then(function(r){
-      if (!r.ok) throw new Error('任务已不存在或服务已重启，请重新提交');
-      return r.json();
+// ---- 多任务轮询：所有未完结任务并行拉状态，互不干扰 ----
+function startPolling() {
+  if (pollTimer) return;
+  pollTimer = setTimeout(pollOnce, 800);
+}
+
+function pollOnce() {
+  pollTimer = null;
+  var active = [];
+  tasks.forEach(function(st, tid){ if (!st.finished) active.push(tid); });
+  if (!active.length) { renderLog(); return; }
+  var jobs = active.map(function(tid){
+    return fetch('/api/task/' + tid)
+      .then(function(r){
+        if (!r.ok) throw new Error('gone');
+        return r.json();
+      })
+      .then(function(t){ updateRow(tid, t); })
+      .catch(function(){ markRowDead(tid); });
+  });
+  Promise.all(jobs).catch(function(){}).then(function(){
+    renderLog();
+    pollTimer = setTimeout(pollOnce, 1500);
+  });
+}
+
+function updateRow(tid, t) {
+  const st = tasks.get(tid);
+  if (!st) return;
+  st.lastLog = t.log || [];
+  st.status = t.status;
+  var pct = typeof t.progress === 'number'
+    ? t.progress
+    : (t.total ? (t.done * 100.0 / t.total) : 0);
+  pct = Math.max(0, Math.min(100, pct));
+  var statusText = t.status === 'done' ? 'done'
+    : t.status === 'failed' ? 'fail'
+    : t.status === 'pending' ? 'queue'
+    : 'processing';
+  const tr = document.getElementById('row_' + tid);
+  if (!tr) return;
+  const cls = "st-" + statusText;
+  let action = "";
+  let info;
+  if (t.status === "done") {
+    st.finished = true;
+    action = `<a class="btn" href="/api/task/${tid}/download">下载 ZIP</a>`;
+    info = "全部完成";
+  } else if (t.status === "failed") {
+    st.finished = true;
+    info = "失败：" + (t.error || "详见处理记录");
+  } else if (t.status === "pending") {
+    info = "排队中…（前面的任务转换完就轮到）";
+  } else {
+    info = t.current ? "正在处理：" + t.current : "等待转换引擎响应";
+  }
+  updateDlAll();
+  tr.innerHTML = `
+    <td>${st.name} <span style="color:#9ca3af">(${tid.slice(0,8)})</span></td>
+    <td class="size">${t.total}个文件</td>
+    <td class="${cls}">${statusText}</td>
+    <td><div class="progress-track"><div class="progress-fill" id="bar_${tid}" style="width:${pct}%"></div></div></td>
+    <td>${info}</td>
+    <td>${action}</td>`;
+}
+
+function markRowDead(tid) {
+  const st = tasks.get(tid);
+  if (!st) return;
+  st.finished = true;
+  st.status = "failed";
+  updateDlAll();
+  const tr = document.getElementById('row_' + tid);
+  if (tr) tr.innerHTML = `
+    <td>${st.name} <span style="color:#9ca3af">(${tid.slice(0,8)})</span></td>
+    <td class="size">-</td>
+    <td class="st-fail">fail</td>
+    <td><div class="progress-track"><div class="progress-fill" id="bar_${tid}" style="width:0%"></div></div></td>
+    <td>任务不存在或服务已重启，请重新提交</td>
+    <td></td>`;
+}
+
+// ---- 日志：系统提示 + 各任务逐文件记录，按任务号区分 ----
+var sysMsgs = [];
+function setLog(s) {
+  if (s) sysMsgs.push('[' + new Date().toLocaleTimeString() + '] ' + s);
+  if (sysMsgs.length > 50) sysMsgs = sysMsgs.slice(-50);
+  renderLog();
+}
+
+function renderLog() {
+  var lines = sysMsgs.slice();
+  tasks.forEach(function(st, tid){
+    (st.lastLog || []).forEach(function(l){ lines.push('[' + tid.slice(0,8) + '] ' + l); });
+  });
+  document.getElementById('log').textContent = lines.join('\n') || '';
+}
+
+// ---- 合并下载：所有已完成任务的输出打进一个 ZIP（服务端按任务号分目录） ----
+function doneTaskIds() {
+  var ids = [];
+  tasks.forEach(function(st, tid){ if (st.status === 'done') ids.push(tid); });
+  return ids;
+}
+
+function updateDlAll() {
+  var btn = document.getElementById('dlAllBtn');
+  if (!btn) return;
+  var n = doneTaskIds().length;
+  btn.textContent = n > 0 ? ('下载全部（' + n + '）') : '下载全部';
+  btn.disabled = n === 0;
+}
+
+function downloadAll() {
+  var ids = doneTaskIds();
+  if (!ids.length) { alert('还没有已完成的任务'); return; }
+  setLog('合并下载 ' + ids.length + ' 个任务的输出…');
+  window.location.href = '/api/tasks/download?ids=' + ids.join(',');
+}
+
+// ---- 服务状态栏：只读 /api/health，5 秒刷新 ----
+function refreshSvc() {
+  fetch('/api/health')
+    .then(function(r){ return r.json(); })
+    .then(function(h){
+      var detail = h.workers_detail || [];
+      var alive = detail.filter(function(w){ return w.proc_alive; }).length;
+      var wordCount = detail.filter(function(w){ return w.word_alive; }).length;
+      document.getElementById('svcStatus').textContent =
+        '转换进程 ' + alive + '/' + h.workers +
+        '（忙 ' + h.busy + '）· 排队 ' + (h.queued == null ? '-' : h.queued) +
+        ' · Word 实例 ' + wordCount;
     })
-    .then(function(t){
-      var pct = typeof t.progress === 'number'
-        ? t.progress
-        : (t.total ? (t.done * 100.0 / t.total) : 0);
-      pct = Math.max(0, Math.min(100, pct));
-      var statusText = t.status === 'done' ? 'done'
-        : t.status === 'failed' ? 'fail'
-        : t.status === 'pending' ? 'queue'
-        : 'processing';
-      const tr = taskMap.get(taskId);
-      if(!tr) return;
-      const cls = "st-" + statusText;
-      const barEl = document.getElementById(`bar_${taskId}`);
-      if(barEl) barEl.style.width = pct.toFixed(1) + '%';
-
-      let action = "";
-      if (t.status === "done") {
-        action = `<a class="btn" href="/api/task/${taskId}/download">下载 ZIP</a>`;
-        document.getElementById('dlBtn').href = `/api/task/${taskId}/download`;
-        document.getElementById('goBtn').disabled = false;
-      }else if(t.status === "failed"){
-        document.getElementById('goBtn').disabled = false;
-      }
-
-      tr.innerHTML = `
-        <td>批量任务 ${taskId.slice(0,8)}</td>
-        <td class="size">${t.total}个文件</td>
-        <td class="${cls}">${statusText}</td>
-        <td><div class="progress-track"><div class="progress-fill" id="bar_${taskId}" style="width:${pct}%"></div></div></td>
-        <td>${t.current? "正在处理："+t.current : (t.status==="done"?"全部完成":"等待转换引擎响应")}</td>
-        <td>${action}</td>`;
-
-      setLog(t.log.join('\n'));
-      if (t.status === 'done' || t.status === 'failed') {
-        return;
-      } else {
-        pollDelay = t.status === 'pending'
-          ? Math.min(5000, pollDelay + 400)
-          : 1200;
-        pollTimer = setTimeout(poll, pollDelay);
-      }
-    })
-    .catch(function(e){
-      if (pollTimer) clearTimeout(pollTimer);
-      setLog('轮询异常: ' + e.message);
+    .catch(function(){
+      document.getElementById('svcStatus').textContent = '服务状态获取失败';
     });
 }
-
-function setLog(s) { document.getElementById('log').textContent = s || ''; }
+refreshSvc();
+setInterval(refreshSvc, 5000);
 </script>
 </body>
 </html>
@@ -1316,6 +1666,11 @@ def auth():
             return jsonify({"error": "unauthorized"}), 401
 
 
+@app.errorhandler(413)
+def upload_too_large(e):
+    return jsonify({"error": "上传内容超过上限 %d MB，请减少文件数量或体积" % MAX_UPLOAD_MB}), 413
+
+
 @app.get("/")
 def index():
     return Response(INDEX_HTML, mimetype="text/html; charset=utf-8")
@@ -1323,29 +1678,27 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "pid": os.getpid(),
-        "workers": WORKERS,
-        "word_alive": manager.word_alive(),          # 一眼看出现在占不占
-        "word_idle_timeout": WORD_IDLE_TIMEOUT,
-        "word_per_task": WORD_PER_TASK,
-        "queued": manager._queue.qsize(),
-        "busy": getattr(manager, "_busy", 0),
-        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    })
+    # 只读子进程上报的普通状态；绝不在请求线程里碰 Word COM 对象
+    return jsonify(manager.health())
 
 
 @app.post("/api/word/release")
 def word_release():
-    """手动释放 Word 实例。有任务在跑时拒绝（409）。"""
+    """通知所有转换子进程释放各自的 Word 实例。有任务在跑时拒绝（409）。"""
     with manager._lock:
         running = any(t["status"] in ("pending", "running")
                       for t in manager._tasks.values())
-    if running or getattr(manager, "_busy", 0) > 0:
+    if running or manager.busy_count() > 0:
         return jsonify({"error": "有任务正在处理，拒绝释放"}), 409
-    released = manager._release_word(None, reason="手动调用 /api/word/release")
-    return jsonify({"released": released, "word_alive": manager.word_alive()})
+    notified = manager.request_release_all()
+    if notified <= 0:
+        return jsonify({"error": "没有可通知的转换子进程（服务未启动或队列已满）"}), 500
+    return jsonify({
+        "released": True,
+        "notified": notified,
+        # 释放是异步的：子进程收到指令后自己 Quit，几秒后再查 /api/health 可看到 word_alive=false
+        "word_alive": any(w["word_alive"] for w in manager._workers.values()),
+    })
 
 
 def _save_upload(f):
@@ -1440,7 +1793,10 @@ def _convert_impl():
             return _bad("文件数超过上限 %d" % MAX_FILES)
         out_dir = (form.get("out_dir") or "").strip() or None
         split_dirs = (form.get("split_dirs") or "").strip().lower() in ("1", "true", "on", "yes")
-        task_id = manager.submit_map(items, out_dir, split_dirs)
+        try:
+            task_id = manager.submit_map(items, out_dir, split_dirs)
+        except QueueFullError as e:
+            return _bad(str(e), 503)
         return jsonify({
             "task_id": task_id,
             "total": len({s for s, _ in items}),
@@ -1490,7 +1846,10 @@ def _convert_impl():
 
     out_dir = (form.get("out_dir") or "").strip() or None
     split_dirs = (form.get("split_dirs") or "").strip().lower() in ("1", "true", "on", "yes")
-    task_id = manager.submit(files, formats, out_dir, split_dirs)
+    try:
+        task_id = manager.submit(files, formats, out_dir, split_dirs)
+    except QueueFullError as e:
+        return _bad(str(e), 503)
     return jsonify({
         "task_id": task_id,
         "total": len(files), "formats": formats,
@@ -1535,6 +1894,55 @@ def task_status(tid):
     return jsonify(t)
 
 
+@app.get("/api/tasks/download")
+def tasks_download():
+    """合并下载多个已完成任务的输出：ids=逗号分隔的任务号。
+    ZIP 内按任务号前缀分目录，避免不同任务的同名输出互相覆盖。"""
+    ids_raw = (request.args.get("ids") or "").strip()
+    tids = [x.strip() for x in ids_raw.split(",") if x.strip()]
+    if not tids:
+        return jsonify({"error": "缺少 ids 参数（逗号分隔的任务号）"}), 400
+    if len(tids) > 50:
+        return jsonify({"error": "一次最多合并下载 50 个任务"}), 400
+    tasks_data = []
+    unknown = []
+    for tid in tids:
+        t = manager.get(tid)
+        if t and t["status"] == "done":
+            tasks_data.append(t)
+        else:
+            unknown.append(tid[:8])
+    if not tasks_data:
+        return jsonify({"error": "没有已完成的任务可下载"}), 400
+    fd, zip_path = tempfile.mkstemp(prefix="rtf_download_", suffix=".zip", dir=OUTPUT_DIR)
+    os.close(fd)
+    try:
+        added = 0
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+            for t in tasks_data:
+                prefix = t["id"][:8]
+                for entry in t["results"]:
+                    for p in entry["outputs"]:
+                        if os.path.exists(p):
+                            rel = os.path.relpath(p, t["out_dir"])
+                            if rel.startswith(".."):
+                                rel = os.path.basename(p)
+                            z.write(p, os.path.join(prefix, rel))
+                            added += 1
+        if added == 0:
+            _safe_remove(zip_path)
+            return jsonify({"error": "所有输出文件都已不存在（可能已被清理）"}), 400
+    except Exception as e:
+        _safe_remove(zip_path)
+        return jsonify({"error": "打包失败：%s" % e}), 500
+    resp = send_file(zip_path, mimetype="application/zip", as_attachment=True,
+                     download_name="rtf_tasks_%s.zip" % datetime.now().strftime("%Y%m%d_%H%M%S"))
+    resp.call_on_close(lambda: _safe_remove(zip_path))
+    if unknown:
+        log.info("[合并下载] 跳过 %d 个未完成/不存在的任务：%s", len(unknown), unknown)
+    return resp
+
+
 @app.get("/api/task/<tid>/download")
 def download(tid):
     t = manager.get(tid)
@@ -1556,10 +1964,10 @@ def download(tid):
                      download_name="%s_output.zip" % tid)
     resp.call_on_close(lambda: _safe_remove(zip_path))
 
-    # 下载完成：设置延迟删除时间（本次修正：用 DOWNLOAD_CLEAN_DELAY，而非下一个凌晨2点）
+    # 下载完成：设置延迟删除时间（本次修正：manager.get() 返回的是副本，
+    # 原来改副本等于没改；现在用 set_clean_after 真正写到原任务上）
     if t.get("is_temp"):
-        with manager._lock:
-            t["clean_after"] = time.time() + DOWNLOAD_CLEAN_DELAY
+        manager.set_clean_after(tid, time.time() + DOWNLOAD_CLEAN_DELAY)
         log.info("[下载] 任务 %s 下载完成，将在 %d 秒后清理: %s",
                  tid, DOWNLOAD_CLEAN_DELAY, t["out_dir"])
 
@@ -1574,22 +1982,29 @@ if __name__ == "__main__":
     print(">>> UPLOAD_DIR   = %s (存在=%s)" % (UPLOAD_DIR, os.path.isdir(UPLOAD_DIR)))
     print(">>> 清理策略：uploads=%d天, tmp任务=%d天, 下载延迟=%d秒"
           % (UPLOAD_EXPIRE_DAYS, TMP_TASK_EXPIRE_DAYS, DOWNLOAD_CLEAN_DELAY))
+    print(">>> 架构：Flask 主进程 + %d 个转换子进程（各持独立 Word 实例）" % WORKERS)
+    print(">>> 并发保护：队列上限=%d, 上传上限=%dMB, 大文件跨进程互斥=%.1fMB"
+          % (QUEUE_MAX, MAX_UPLOAD_MB, LARGE_RTF_BYTES / (1024.0 * 1024.0)))
     print(">>> Word 生命周期：空闲释放=%s秒, 每任务一实例=%s, 回收阈值=%d文件/%d秒, RPC重试=%d次"
           % (WORD_IDLE_TIMEOUT or "永不", WORD_PER_TASK,
              WORD_RECYCLE_FILES, WORD_RECYCLE_SECONDS, RPC_RETRY))
-    print(">>> 看门狗：单文件/单任务无心跳超过 %d 秒判定卡死并换线程（残留 Word 强杀=%s）"
-          % (WORD_STUCK_TIMEOUT, WORD_KILL_STALE))
+    print(">>> 看门狗：worker %d 秒无心跳 -> 终止该转换子进程 + 强杀其 WINWORD + 只失败该任务"
+          % WORD_STUCK_TIMEOUT)
     if os.path.isdir(OUTPUT_DIR):
         print(">>> OUTPUT_DIR 内容: %s" % os.listdir(OUTPUT_DIR))
     if os.path.isdir(UPLOAD_DIR):
         print(">>> UPLOAD_DIR 内容: %s" % os.listdir(UPLOAD_DIR))
 
+    # 拉起转换子进程 + 监管线程（必须在主进程里做，spawn 子进程会重新 import 本模块）
+    manager.start()
+    print(">>> 转换子进程已启动（懒加载 Word），监管线程运行中")
+
     # 启动统一清理线程
     cleaner = threading.Thread(target=_auto_clean_all, daemon=True)
     cleaner.start()
     print(">>> 清理线程已启动 (alive=%s)" % cleaner.is_alive())
-    print(">>> Word 未启动（懒加载），首次提交任务时才拉起")
     print("=" * 60)
 
-    log.info("RTF 转换服务启动 http://%s:%s", HOST, PORT)
+    log.info("RTF 转换服务启动 http://%s:%s（多进程模式：%d 个转换子进程）",
+             HOST, PORT, WORKERS)
     app.run(host=HOST, port=PORT, threaded=True, use_reloader=False)

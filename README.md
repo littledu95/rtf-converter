@@ -7,6 +7,25 @@
 
 多人同时提交自动排队串行执行（Word 单实例安全），每个任务独立进度与日志。
 
+## 崩溃诊断与隔离（2026-11-16）
+
+每个任务在独立 Python 子进程中运行 Word/WPS，任务结束释放引擎。
+文件夹选择器运行在独立进程的主线程中，避免 Tk 与 HTTP 工作线程冲突。
+健康检查不再跨线程访问 COM；`word_alive` 表示转换槽位忙碌，不是对 Word 的实时探测。
+
+- `WORD_STUCK_TIMEOUT`：默认 600 秒，无文件进度则终止当前转换进程，仅当前任务失败，队列继续。大文件耗时较长时可调大，0 表示禁用。
+- Word 尝试加入 Windows Job Object，子进程退出时回收该实例。注册失败会记录日志，可能残留 Word。WPS 不强制加入，避免影响已有 WPS 会话。
+- 每任务独立进程取代跨任务复用：`WORD_IDLE_TIMEOUT`、`WORD_POLL_INTERVAL`、`WORD_PER_TASK`、`WORD_WORKER_RESTART_DELAY`、`WORD_KILL_STALE` 不再控制服务行为。单任务内 RPC 重试及主动回收仍保留。
+- `logs/server.log`：主日志，含 PID、线程名、完整异常堆栈，单文件 10 MB，保留 5 份备份。
+- `logs/server-crash.log`：Python 可捕获的原生崩溃线程堆栈。
+- `logs/conversion-<PID>.log`、`conversion-<PID>-crash.log`：转换详情与超时前堆栈；主日志记录任务 ID 与 PID 的对应关系。
+- `logs/conversion-<任务ID>-console.log`：转换子进程启动输出。
+- `logs/startup-stderr.log`：启动脚本捕获的错误输出，包括导入失败；下次启动覆盖。
+
+下次故障时保留 `logs` 中对应时间的主日志和转换日志。队列仍在内存中，服务整体重启不会恢复任务。系统强制结束或断电不保证留下堆栈；转换子进程异常退出码会写入主日志。转换日志按进程保存，需定期归档清理。
+
+验证：`python -m unittest test_resilience -v`，无需 Office，覆盖超时后队列继续、输出重名保护和启动异常落盘。真实 Word/WPS 转换需在部署机验证。
+
 ## 目录
 
 
@@ -159,5 +178,5 @@ open("out.zip", "wb").write(requests.get(f"http://127.0.0.1:8000/api/task/{tid}/
 | ------------------------ | -------------------------------------------- |
 | 任务 failed：Word COM 初始化失败 | 确认运行机安装了 Microsoft Word（WPS 不支持）             |
 | docx 输出为 FAIL：文件发生错误 | 已自动切换 WPS 兜底；若仍未装 WPS，任务会明确标记 docx 失败，doc/pdf 不受影响 |
-| 端口被占用                    | start.bat 会自动清理同机 python 进程；非 python 占用需手动处理 |
+| 端口被占用                    | start.bat 拒绝结束占用进程，请先确认端口归属 |
 | 服务重启后任务消失                | 内存队列特性，属预期                                   |
